@@ -1,5 +1,5 @@
-use regex::Regex;
 use std::{
+    cmp::min,
     collections::HashMap,
     env, fs, io,
     sync::{Arc, Mutex},
@@ -21,36 +21,67 @@ impl Config {
     }
 }
 
-static THREAD_COUNT: i32 = 10;
+const THREAD_COUNT: usize = 10;
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let config = Config::new(args).unwrap();
+    let config = match Config::new(args) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("{}", e);
+            return;
+        }
+    };
     let mut files: Vec<String> = Vec::new();
 
     if let Err(e) = list_files(&config.dir_name, &mut files) {
         println!("Error {}", e);
     }
 
+    if files.is_empty() {
+        println!("Directory is empty");
+        return;
+    }
+
     let total_word_count = Arc::new(Mutex::new(0));
     let shared_files = Arc::new(files);
     let map: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+    let len = shared_files.len();
+    let thread_count = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(THREAD_COUNT);
+    let files_per_thread = (len + thread_count - 1) / thread_count;
+
     let mut handles = Vec::new();
 
-    for i in 0..THREAD_COUNT {
+    for i in 0..thread_count {
         let shared_files = Arc::clone(&shared_files);
         let shared_map = Arc::clone(&map);
         let shared_word_count = Arc::clone(&total_word_count);
-        let files_per_thread = shared_files.len() as i32 / THREAD_COUNT;
+
+        let start = (i * files_per_thread) as usize;
+
+        if start >= len {
+            break;
+        }
+
+        let end = min(len, start + files_per_thread);
+
         let handle = thread::spawn(move || {
-            let start = (i * files_per_thread) as usize;
-            let end = ((i + 1) * files_per_thread) as usize;
+            let mut local_count: u64 = 0;
+            let mut local_map: Vec<(String, u64)> = Vec::new();
             for file in &shared_files[start..end] {
                 let count = word_count(file);
-                let mut global_count = shared_word_count.lock().unwrap();
-                *global_count += count;
+                local_count += count;
 
-                let mut map = shared_map.lock().unwrap();
-                map.insert(file.to_string(), count);
+                local_map.push((file.to_string(), count));
+            }
+
+            let mut global_count = shared_word_count.lock().unwrap();
+            *global_count += local_count;
+
+            let mut map = shared_map.lock().unwrap();
+            for entry in local_map {
+                map.insert(entry.0, entry.1);
             }
         });
 
@@ -60,17 +91,20 @@ fn main() {
     for handle in handles {
         handle.join().unwrap();
     }
-    println!("Count : {}", total_word_count.lock().unwrap());
+    println!("Count : {}", *total_word_count.lock().unwrap());
     println!("Map : {:?}", map.lock().unwrap());
 }
 
 fn word_count(file_name: &str) -> u64 {
-    let content = fs::read_to_string(file_name).expect("Error reading file");
-    let pattern = Regex::new(r"\s+").unwrap();
+    let content = match fs::read_to_string(file_name) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error reading file {}: {}", file_name, e);
+            return 0;
+        }
+    };
 
-    let words: Vec<&str> = pattern.split(&content).collect();
-
-    words.len() as u64
+    content.split_whitespace().count() as u64
 }
 
 fn list_files(dir: &str, files: &mut Vec<String>) -> io::Result<()> {
